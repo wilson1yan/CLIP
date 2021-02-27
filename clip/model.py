@@ -148,6 +148,22 @@ class ModifiedResNet(nn.Module):
 
         return x
 
+    def get_features(self, x):
+        def stem(x):
+            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
+                x = self.relu(bn(conv(x)))
+            x = self.avgpool(x)
+            return x
+
+        x = x.type(self.conv1.weight.dtype)
+        x = stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        return x
+
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -202,6 +218,7 @@ class VisualTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution
+        self.patch_size = patch_size
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
@@ -231,6 +248,26 @@ class VisualTransformer(nn.Module):
 
         if self.proj is not None:
             x = x @ self.proj
+
+        return x
+
+    def get_features(self, x):
+        b = x.shape[0]
+        
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        
+        grid = int(self.input_resolution // self.patch_size)
+        x = x[:, 1:, :]
+        x = x.view(b, grid, grid, -1)
 
         return x
 
@@ -331,6 +368,18 @@ class CLIP(nn.Module):
     @property
     def dtype(self):
         return self.visual.conv1.weight.dtype
+
+    def get_features_image(self, image):
+        return self.visual.get_features(image.type(self.dtype))
+    
+    def get_features_text(self, text):
+        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        return x
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
